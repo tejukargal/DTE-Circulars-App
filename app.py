@@ -1,494 +1,357 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import json
-from anthropic import Anthropic
-from dotenv import load_dotenv
-import os
-import chardet
+import requests
+from bs4 import BeautifulSoup
 import io
-import sys
-import traceback
+from datetime import datetime
+import time
+import warnings
+import urllib3
+from datetime import datetime
+import base64
+import socket
 
-# Loading environment variables from .env file
-load_dotenv()
+# Disable SSL verification warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-def detect_encoding(file_content):
-    """Detect the encoding of the file content"""
-    result = chardet.detect(file_content)
-    return result['encoding']
+# URLs dictionary
+urls = {
+    "Departmental Circulars": "https://dtek.karnataka.gov.in/info-4/Departmental+Circulars/kn",
+    "DVP Circulars": "https://dtek.karnataka.gov.in/page/Circulars/DVP/kn",
+    "ACM-Polytechnic Circulars": "https://dtek.karnataka.gov.in/page/Circulars/ACM-Polytechnic/kn",
+    "Exam Circulars": "https://dtek.karnataka.gov.in/page/Circulars/Exam/kn"
+}
 
-def read_csv_with_encoding(file):
-    """Read CSV file with automatic encoding detection"""
+# Increased socket timeout globally
+socket.setdefaulttimeout(60)
+
+def display_pdf(url):
     try:
-        content = file.read()
-        file.seek(0)
-        encoding = detect_encoding(content)
-        
-        try:
-            df = pd.read_csv(file, encoding=encoding)
-            return df, None
-        except Exception as e:
-            common_encodings = ['utf-8', 'latin1', 'iso-8859-1', 'cp1252']
-            for enc in common_encodings:
-                try:
-                    file.seek(0)
-                    df = pd.read_csv(file, encoding=enc)
-                    return df, None
-                except:
-                    continue
-            
-            return None, f"Failed to read file with any encoding. Error: {str(e)}"
-            
-    except Exception as e:
-        return None, f"Error reading file: {str(e)}"
-
-def get_dataframe_info(df):
-    """Get information about the dataframe"""
-    # Create a safe JSON-serializable version of the describe data
-    describe_df = df.describe(include='all').fillna("NA")
-    
-    # Convert NumPy types to Python native types for JSON serialization
-    describe_dict = {}
-    for col in describe_df.columns:
-        describe_dict[col] = {}
-        for idx in describe_df.index:
-            val = describe_df.loc[idx, col]
-            if isinstance(val, (np.int64, np.int32, np.int16, np.int8)):
-                val = int(val)
-            elif isinstance(val, (np.float64, np.float32, np.float16)):
-                val = float(val)
-            elif val == "NA":
-                val = None
-            describe_dict[col][idx] = val
-    
-    # Get basic info
-    info = {
-        "columns": list(df.columns),
-        "shape": df.shape,
-        "dtypes": {col: str(df[col].dtype) for col in df.columns},
-        "sample_rows": df.head(5).to_dict(orient="records"),
-        "describe": describe_dict,
-        "null_counts": df.isnull().sum().to_dict(),
-        "column_unique_counts": {col: int(df[col].nunique()) for col in df.columns}
-    }
-    return info
-
-def infer_financial_data_structure(df):
-    """Try to infer if this is financial data and how it's structured"""
-    financial_indicators = {
-        'credits': ['credit', 'income', 'revenue', 'received', 'deposit', 'receipt', 'inflow', 'cr'],
-        'debits': ['debit', 'expense', 'payment', 'paid', 'withdrawal', 'outflow', 'dr'],
-        'amount': ['amount', 'value', 'sum', 'total', 'price', 'cost', 'fee'],
-        'date': ['date', 'day', 'transaction_date', 'txn_date', 'time']
-    }
-    
-    # Check column names for financial indicators
-    column_mapping = {}
-    for col in df.columns:
-        col_lower = col.lower()
-        for category, indicators in financial_indicators.items():
-            if any(indicator in col_lower for indicator in indicators):
-                column_mapping[category] = col
-                break
-                
-    # If we don't have explicit credit/debit columns, see if there's a single amount column
-    # and possibly a transaction type column
-    if 'credits' not in column_mapping and 'debits' not in column_mapping and 'amount' in column_mapping:
-        # Look for a type column that might indicate credit/debit
-        for col in df.columns:
-            col_lower = col.lower()
-            if 'type' in col_lower or 'category' in col_lower or 'transaction' in col_lower:
-                column_mapping['type'] = col
-                # See if values contain credit/debit indicators
-                if df[col].dtype == 'object':
-                    values = df[col].dropna().astype(str).str.lower()
-                    has_credit = any(credit in ' '.join(values) for credit in financial_indicators['credits'])
-                    has_debit = any(debit in ' '.join(values) for debit in financial_indicators['debits'])
-                    if has_credit and has_debit:
-                        column_mapping['has_transaction_types'] = True
-                        
-    return column_mapping
-
-def extract_and_execute_code(text, df):
-    """Extract Python code from Claude's response and execute it"""
-    results = []
-    
-    # Try to infer if this is financial data
-    financial_structure = infer_financial_data_structure(df)
-    
-    # Check if there's any code block
-    if "```python" in text and "```" in text:
-        code_blocks = []
-        
-        # Extract all code blocks
-        parts = text.split("```")
-        for i, part in enumerate(parts):
-            if i % 2 == 1 and (part.startswith("python") or part.startswith("py")):
-                code = part.replace("python", "").replace("py", "").strip()
-                code_blocks.append(code)
-        
-        # Execute each code block
-        for code in code_blocks:
-            try:
-                # Create execution environment with DataFrame already loaded
-                local_vars = {"df": df, "pd": pd, "np": np}
-                
-                # Capture stdout
-                output_buffer = io.StringIO()
-                original_stdout = sys.stdout
-                sys.stdout = output_buffer
-                
-                # Execute the code
-                exec(code, {"pd": pd, "np": np}, local_vars)
-                
-                # Reset stdout
-                sys.stdout = original_stdout
-                
-                # Get print outputs
-                output = output_buffer.getvalue()
-                if output:
-                    results.append({"type": "text", "content": output})
-                
-                # Look for new variables that might be DataFrames
-                for var_name, var_value in local_vars.items():
-                    if var_name not in ["df", "pd", "np"] and isinstance(var_value, pd.DataFrame):
-                        results.append({"type": "dataframe", "content": var_value, "name": var_name})
-                    elif var_name not in ["df", "pd", "np"] and isinstance(var_value, list):
-                        results.append({"type": "list", "content": var_value, "name": var_name})
-                
-                # If no output was captured and no new variables, show the original df with filters
-                if not results:
-                    # Try to find filtered dataframes in the local vars
-                    for var_name, var_value in local_vars.items():
-                        if var_name not in ["df", "pd", "np"]:
-                            if isinstance(var_value, pd.DataFrame):
-                                results.append({"type": "dataframe", "content": var_value, "name": var_name})
-                            elif isinstance(var_value, (list, tuple)):
-                                results.append({"type": "list", "content": var_value, "name": var_name})
-                            else:
-                                results.append({"type": "variable", "content": str(var_value), "name": var_name})
-                
-                # If still no results, evaluate the last line as an expression
-                if not results and len(code.strip().split('\n')) > 0:
-                    last_line = code.strip().split('\n')[-1]
-                    # Check if the last line is an expression (not an assignment)
-                    if "=" not in last_line or "==" in last_line or "<=" in last_line or ">=" in last_line:
-                        try:
-                            result_value = eval(last_line, {"pd": pd, "np": np}, local_vars)
-                            if isinstance(result_value, pd.DataFrame):
-                                results.append({"type": "dataframe", "content": result_value, "name": "Result"})
-                            elif isinstance(result_value, (list, tuple)):
-                                results.append({"type": "list", "content": result_value, "name": "Result"})
-                            else:
-                                results.append({"type": "variable", "content": str(result_value), "name": "Result"})
-                        except:
-                            pass
-                
-            except Exception as e:
-                error_msg = f"Error executing code: {str(e)}\n{traceback.format_exc()}"
-                results.append({"type": "error", "content": error_msg})
-                
-                # Try fallback strategies based on the query context
-                
-                # Fallback for credits and debits merging
-                if "merge" in text.lower() and ("credit" in text.lower() or "debit" in text.lower()):
-                    try:
-                        # Check if we identified financial columns
-                        if financial_structure:
-                            merged_data = None
-                            
-                            # Case 1: Separate credit and debit dataframes
-                            if "credits" in financial_structure and "debits" in financial_structure:
-                                # Create a merged view with transaction type indicator
-                                credits = df.copy()
-                                credits['Transaction_Type'] = 'Credit'
-                                
-                                debits = df.copy()
-                                debits['Transaction_Type'] = 'Debit'
-                                
-                                merged_data = pd.concat([credits, debits], ignore_index=True)
-                                if 'date' in financial_structure:
-                                    merged_data = merged_data.sort_values(by=financial_structure['date'])
-                                    
-                            # Case 2: Single dataframe with amount and transaction type
-                            elif 'amount' in financial_structure and 'type' in financial_structure:
-                                merged_data = df.copy()
-                                if 'date' in financial_structure:
-                                    merged_data = merged_data.sort_values(by=financial_structure['date'])
-                            
-                            # Case 3: Just show the data as is
-                            else:
-                                merged_data = df.copy()
-                            
-                            if merged_data is not None:
-                                results.append({"type": "dataframe", "content": merged_data, "name": "Merged_Transactions"})
-                    except Exception as fallback_error:
-                        # If the fallback also fails, add the original dataframe
-                        results.append({"type": "dataframe", "content": df, "name": "Original_Data"})
-                        
-                # Student filter fallbacks from previous implementation
-                elif "CE" in code and "1st Yr" in code:
-                    try:
-                        # Fallback for CE students in 1st Yr
-                        ce_first_year = df[(df['Course'] == 'CE') & (df['Year'] == '1st Yr')]
-                        results.append({"type": "dataframe", "content": ce_first_year, "name": "CE_First_Year"})
-                    except:
-                        pass
-                elif "EE" in code and "1st Yr" in code:
-                    try:
-                        # Fallback for EE students in 1st Yr
-                        ee_first_year = df[(df['Course'] == 'EE') & (df['Year'] == '1st Yr')]
-                        results.append({"type": "dataframe", "content": ee_first_year, "name": "EE_First_Year"})
-                    except:
-                        pass
-    
-    return results, text
-
-def chat_with_csv_claude(df, query):
-    """Analyze CSV data with Claude API directly"""
-    load_dotenv()
-    anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY')
-    
-    if not anthropic_api_key:
-        return "Error: ANTHROPIC_API_KEY not found in environment variables"
-    
-    client = Anthropic(api_key=anthropic_api_key)
-    
-    # Get dataframe information
-    df_info = get_dataframe_info(df)
-    
-    # Sample data (first 5 rows)
-    sample_data = df.head(5).to_string()
-    
-    # Create a prompt for Claude
-    prompt = f"""
-You are a data analysis assistant. I have a CSV file with the following information:
-
-Shape: {df_info['shape'][0]} rows x {df_info['shape'][1]} columns
-Columns: {', '.join(df_info['columns'])}
-
-Here's a sample of the data (first 5 rows):
-
-{sample_data}
-
-Column data types:
-{json.dumps({col: df_info['dtypes'][col] for col in df_info['columns']}, indent=2)}
-
-Null values per column:
-{json.dumps(df_info['null_counts'], indent=2)}
-
-Unique values count per column:
-{json.dumps(df_info['column_unique_counts'], indent=2)}
-
-My question about this data is:
-{query}
-
-CRITICALLY IMPORTANT: Before writing any code, carefully review the columns available in the dataframe. The DataFrame is already loaded in a variable called 'df'. DO NOT try to read any CSV files. Work directly with the 'df' variable and ONLY use column names that exist in the data.
-
-First, provide a clear concise explanation of how you'll approach this question.
-
-Then, provide the solution using pandas code to get precise results. Include only essential Python code in a code block that will directly answer the question when executed. The code should be complete and work with the existing 'df' variable. Do not include code to read CSV files.
-
-Example of good code:
-```python
-# First check what columns we have
-print(df.columns)
-
-# Then use exact column names from the data
-result_df = df[(df['Column1'] == 'Value1') & (df['Column2'] > 50)]
-print(result_df)
-```
-
-Finally, summarize the results and insights briefly. Remember that your code will be automatically executed, so make sure it outputs the final result.
-"""
-    
-    try:
-        response = client.messages.create(
-            model="claude-3-5-haiku-20241022",
-            max_tokens=2048,
-            temperature=0.2,
-            messages=[{"role": "user", "content": prompt}]
+        # Increased timeout and added retries
+        response = requests.get(
+            url, 
+            verify=False, 
+            timeout=60,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
         )
+        response.raise_for_status()
         
-        response_text = response.content[0].text
-        
-        # Extract and execute code from the response
-        execution_results, text = extract_and_execute_code(response_text, df)
-        
-        return {"text": text, "results": execution_results}
+        base64_pdf = base64.b64encode(response.content).decode('utf-8')
+        pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
+        st.markdown(pdf_display, unsafe_allow_html=True)
+    except requests.exceptions.Timeout:
+        st.error("PDF ಡೌನ್‌ಲೋಡ್ ಮಾಡಲು ಸಮಯ ಮೀರಿದೆ. ದಯವಿಟ್ಟು ನಂತರ ಪುನಃ ಪ್ರಯತ್ನಿಸಿ.")
     except Exception as e:
-        return {"text": f"Error calling Anthropic API: {str(e)}", "results": []}
+        st.error(f"PDF ಲೋಡ್ ಮಾಡಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ: {str(e)}")
 
-def display_result(result):
-    """Helper function to display results"""
-    if isinstance(result, dict) and "text" in result and "results" in result:
-        # Extract explanation parts from text without the code blocks
-        explanation = []
-        code_parts = False
-        for line in result["text"].split("\n"):
-            if line.strip() == "```python" or line.strip() == "```py":
-                code_parts = True
-                continue
-            if line.strip() == "```" and code_parts:
-                code_parts = False
-                continue
-            if not code_parts:
-                explanation.append(line)
-        
-        # Show the explanation parts
-        explanation_text = "\n".join([line for line in explanation if line.strip()])
-        if explanation_text:
-            st.write(explanation_text)
-        
-        # Show the execution results
-        if result["results"]:
-            st.markdown("### Analysis Results")
-            for item in result["results"]:
-                if item["type"] == "dataframe":
-                    st.markdown(f"**{item['name']}**")
-                    st.dataframe(item["content"], use_container_width=True)
-                elif item["type"] == "text":
-                    st.text(item["content"])
-                elif item["type"] == "list":
-                    st.markdown(f"**{item['name']}**")
-                    for value in item["content"]:
-                        st.markdown(f"- {value}")
-                elif item["type"] == "variable":
-                    st.markdown(f"**{item['name']}:** {item['content']}")
-                elif item["type"] == "error":
-                    # Only show errors if there are no other results
-                    if len(result["results"]) == 1:
-                        st.error(item["content"])
-        else:
-            st.warning("No executable results were found. Try a different question or check the data structure.")
-    elif isinstance(result, str):
-        st.write(result)
-    else:
-        st.write(result)
+def parse_date(date_str):
+    try:
+        return datetime.strptime(date_str, '%d/%m/%Y')
+    except:
+        return datetime.strptime('01/01/2000', '%d/%m/%Y')
 
-# Initialize session states
-if 'query_history' not in st.session_state:
-    st.session_state.query_history = []
-if 'current_response' not in st.session_state:
-    st.session_state.current_response = None
-if 'current_question' not in st.session_state:
-    st.session_state.current_question = None
-if 'data_loaded' not in st.session_state:
-    st.session_state.data_loaded = False
-
-def process_query():
-    """Handle query submission"""
-    if st.session_state.text_input.strip():
-        st.session_state.query_history.append(st.session_state.text_input)
-        return True
-    return False
-
-# Set custom CSS
-st.set_page_config(layout='wide')
-st.markdown("""
-    <style>
-    .main > div {
-        padding-top: 1rem;
+def scrape_table(url):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'max-age=0',
+        'Upgrade-Insecure-Requests': '1'
     }
-    .stTextInput > div > div > input {
-        height: 35px;
-    }
-    .error-message {
-        color: #ff4b4b;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        background-color: #ffe5e5;
-    }
-    .stButton button {
-        margin-top: 0 !important;
-        padding-top: 0.5rem !important;
-        padding-bottom: 0.5rem !important;
-    }
-    .stCodeBlock {
-        max-height: 300px;
-        overflow-y: auto;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-st.title("CSV Analysis with Claude")
-st.caption("Powered by Anthropic's Claude")
-
-# Upload multiple CSV files
-input_csvs = st.sidebar.file_uploader("Upload your CSV files", type=['csv'], accept_multiple_files=True)
-
-if input_csvs:
-    # Select a CSV file from the uploaded files
-    file_options = [file.name for file in input_csvs]
-    selected_file = st.selectbox("Select a CSV file", file_options)
-    selected_index = file_options.index(selected_file)
     
-    # Load the selected CSV file only once or when selection changes
-    if not st.session_state.data_loaded or st.session_state.get('selected_file') != selected_file:
-        with st.spinner('Loading CSV file...'):
-            data, error = read_csv_with_encoding(input_csvs[selected_index])
-            if not error:
-                st.session_state.data_loaded = True
-                st.session_state.current_data = data
-                st.session_state.selected_file = selected_file
-            else:
-                st.session_state.data_loaded = False
-    else:
-        data = st.session_state.current_data
-        error = None
+    try:
+        # Implement retry mechanism
+        max_retries = 3
+        retry_count = 0
+        retry_delay = 5  # seconds
         
-    if error:
-        st.error(f"Error loading file: {error}")
-    elif st.session_state.data_loaded:
-        # Data preview with expander
-        with st.expander("Preview Data", expanded=False):
-            st.dataframe(data.head(5), use_container_width=True)
-            st.caption(f"Total rows: {len(data)}, Total columns: {len(data.columns)}")
-        
-        # Create two columns for input and button with better ratio
-        col1, col2 = st.columns([6, 1])
-        
-        # Query input in first column
-        with col1:
-            st.text_input(
-                "Enter your query about the data", 
-                key="text_input",
-                placeholder="e.g., 'What is the average of column X?' or 'Show me trends in this data'"
-            )
-        
-        # Submit button in second column, aligned horizontally
-        with col2:
-            submitted = st.button("Submit", key="submit_btn", use_container_width=True)
-            
-        # Handle query submission and display
-        if submitted and process_query():
-            current_query = st.session_state.text_input
+        while retry_count < max_retries:
             try:
-                # Display the question as regular text
-                st.write("Question:", current_query)
-                st.markdown("---")
-                
-                with st.spinner('Analyzing your data...'):
-                    # Process the query and display results
-                    result = chat_with_csv_claude(data, current_query)
-                    
-                    # Store current question and response
-                    st.session_state.current_question = current_query
-                    st.session_state.current_response = result
-                    
-                    # Display the results
-                    display_result(result)
-                        
-            except Exception as e:
-                st.error(f"Error processing query: {str(e)}")
-                st.info("Try rephrasing your question or check if your ANTHROPIC_API_KEY is properly set in the .env file")
-                
-        # Display previous response if it exists
-        elif st.session_state.current_question is not None and st.session_state.current_response is not None:
-            st.write("Question:", st.session_state.current_question)
-            st.markdown("---")
-            display_result(st.session_state.current_response)
+                # Increased timeout to 60 seconds
+                response = requests.get(url, headers=headers, verify=False, timeout=60)
+                response.raise_for_status()
+                break  # Break the retry loop if successful
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                retry_count += 1
+                if retry_count < max_retries:
+                    st.warning(f"ಸಂಪರ್ಕ ಸಮಸ್ಯೆ, {retry_delay} ಸೆಕೆಂಡುಗಳಲ್ಲಿ ಮರುಪ್ರಯತ್ನಿಸಲಾಗುತ್ತಿದೆ...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    raise  # Re-raise the exception if all retries failed
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, 'html.parser')
+            table = soup.find('table')
             
-else:
-    st.info("👈 Please upload your CSV files using the sidebar")
+            if table:
+                data = []
+                rows = table.find_all('tr')[1:]  # Skip header row
+                
+                progress_bar = st.progress(0)
+                total_rows = len(rows)
+                
+                for idx, row in enumerate(rows):
+                    cols = row.find_all('td')
+                    
+                    # Skip rows with insufficient columns
+                    if len(cols) < 4:
+                        continue
+                        
+                    # Get basic data (first 3 columns)
+                    date = cols[0].text.strip() if cols[0].text.strip() else None
+                    ref_number = cols[1].text.strip() if cols[1].text.strip() else None
+                    subject = cols[2].text.strip() if cols[2].text.strip() else None
+                    
+                    # Skip row if any essential column is missing
+                    if not all([date, ref_number, subject]):
+                        continue
+                    
+                    # Look for hyperlink in 4th or 5th column
+                    download_url = ''
+                    link_text = ''
+                    
+                    # Function to extract link from column
+                    def get_link_from_column(col):
+                        link_element = col.find('a')
+                        if link_element:
+                            href = link_element.get('href', '')
+                            if href and not href.startswith('http'):
+                                href = 'https://dtek.karnataka.gov.in' + href
+                            return href, link_element.text.strip()
+                        return None, col.text.strip()
+                    
+                    # Try 4th column first
+                    if len(cols) >= 4:
+                        download_url, link_text = get_link_from_column(cols[3])
+                    
+                    # If no link found and 5th column exists, try 5th column
+                    if not download_url and len(cols) >= 5:
+                        download_url, link_text = get_link_from_column(cols[4])
+                    
+                    # Skip row if no link text found
+                    if not link_text:
+                        continue
+                    
+                    data.append({
+                        'date_obj': parse_date(date),
+                        'ದಿನಾಂಕ': date,
+                        'ಆದೇಶ ಸಂಖ್ಯೆ': ref_number,
+                        'ವಿಷಯ': subject,
+                        'ಸುತ್ತೋಲೆ': link_text,
+                        'url': download_url
+                    })
+                    
+                    progress_bar.progress((idx + 1) / total_rows)
+                    time.sleep(0.01)
+                
+                if not data:
+                    st.error("ಯಾವುದೇ ಮಾಹಿತಿ ಕಂಡುಬಂದಿಲ್ಲ")
+                    return None
+                
+                df = pd.DataFrame(data)
+                df = df.sort_values('date_obj', ascending=False)
+                df = df.head(50)
+                df.insert(0, 'ಕ್ರಮ ಸಂಖ್ಯೆ', range(1, len(df) + 1))
+                return df
+            else:
+                st.error("ಕೋಷ್ಟಕ ಕಂಡುಬಂದಿಲ್ಲ")
+                return None
+        else:
+            st.error(f"ಸರ್ವರ್ ಪ್ರತಿಕ್ರಿಯೆ ದೋಷ: {response.status_code}")
+            return None
+                
+    except requests.exceptions.Timeout:
+        st.error("ಸರ್ವರ್‌ಗೆ ಸಂಪರ್ಕಿಸಲು ಸಮಯ ಮೀರಿದೆ. ದಯವಿಟ್ಟು ನಂತರ ಮತ್ತೆ ಪ್ರಯತ್ನಿಸಿ.")
+        return None
+    except requests.exceptions.ConnectionError:
+        st.error("ಸರ್ವರ್‌ಗೆ ಸಂಪರ್ಕಿಸಲು ಸಾಧ್ಯವಾಗಲಿಲ್ಲ. ನಿಮ್ಮ ಇಂಟರ್ನೆಟ್ ಸಂಪರ್ಕವನ್ನು ಪರಿಶೀಲಿಸಿ.")
+        return None
+    except Exception as e:
+        st.error(f"ದೋಷ ಸಂಭವಿಸಿದೆ: {str(e)}")
+        return None
+
+def create_excel_file(df):
+    output = io.BytesIO()
+    
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        # Create a copy of dataframe without technical columns
+        excel_df = df.drop(['date_obj', 'url'], axis=1)
+        excel_df.to_excel(writer, sheet_name='Sheet1', index=False)
+        
+        workbook = writer.book
+        worksheet = writer.sheets['Sheet1']
+        
+        # Define formats
+        header_format = workbook.add_format({
+            'bold': True,
+            'font_size': 10,
+            'text_wrap': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'bg_color': '#D9EAD3'
+        })
+        
+        cell_format = workbook.add_format({
+            'font_size': 9,
+            'text_wrap': True,
+            'valign': 'vcenter'
+        })
+        
+        link_format = workbook.add_format({
+            'font_size': 9,
+            'font_color': 'blue',
+            'underline': True
+        })
+        
+        watermark_format = workbook.add_format({
+            'font_size': 10,
+            'italic': True,
+            'font_color': '#888888',
+            'align': 'right'
+        })
+        
+        # Set column widths
+        worksheet.set_column('A:A', 6)   # Sl No
+        worksheet.set_column('B:B', 12)  # Date
+        worksheet.set_column('C:C', 20)  # Reference No
+        worksheet.set_column('D:D', 50)  # Subject
+        worksheet.set_column('E:E', 15)  # Circular link
+        
+        # Format headers
+        for col_num, value in enumerate(excel_df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+        
+        # Write data with formatting and hyperlinks
+        for row_num in range(len(df)):
+            # Write regular columns
+            worksheet.write(row_num + 1, 0, excel_df.iloc[row_num]['ಕ್ರಮ ಸಂಖ್ಯೆ'], cell_format)
+            worksheet.write(row_num + 1, 1, excel_df.iloc[row_num]['ದಿನಾಂಕ'], cell_format)
+            worksheet.write(row_num + 1, 2, excel_df.iloc[row_num]['ಆದೇಶ ಸಂಖ್ಯೆ'], cell_format)
+            worksheet.write(row_num + 1, 3, excel_df.iloc[row_num]['ವಿಷಯ'], cell_format)
+            
+            # Write hyperlink in the last column
+            if df.iloc[row_num]['url']:
+                worksheet.write_url(
+                    row_num + 1, 4,
+                    df.iloc[row_num]['url'],
+                    link_format,
+                    string=df.iloc[row_num]['ಸುತ್ತೋಲೆ']
+                )
+            else:
+                worksheet.write(row_num + 1, 4, df.iloc[row_num]['ಸುತ್ತೋಲೆ'], cell_format)
+        
+        # Add watermark at the bottom of the sheet
+        last_row = len(df) + 3
+        worksheet.merge_range(last_row, 0, last_row, 4, "by Teju SMP", watermark_format)
+    
+    return output.getvalue()
+
+def add_watermark():
+    # Add watermark using CSS
+    st.markdown(
+        """
+        <style>
+        .watermark {
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            opacity: 0.7;
+            z-index: 999;
+            color: #888;
+            font-style: italic;
+        }
+        </style>
+        <div class="watermark">by Teju SMP</div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def main():
+    st.set_page_config(page_title="ಕರ್ನಾಟಕ ತಾಂತ್ರಿಕ ಶಿಕ್ಷಣ ಇಲಾಖೆ - ಸುತ್ತೋಲೆಗಳು", layout="wide")
+    
+    # Add watermark to UI
+    add_watermark()
+    
+    st.title("ಕರ್ನಾಟಕ ತಾಂತ್ರಿಕ ಶಿಕ್ಷಣ ಇಲಾಖೆ - ಸುತ್ತೋಲೆಗಳು")
+    
+    # Sub-header with watermark
+    st.markdown("<h3 style='text-align: center;'>ಸುತ್ತೋಲೆ ಡೌನ್‌ಲೋಡರ್ <span style='font-size: 12px; font-style: italic; color: #888;'>by Teju SMP</span></h3>", 
+                unsafe_allow_html=True)
+    
+    # Display connection status warning for cloud deployment
+    st.warning("""
+    ಗಮನಿಸಿ: ಕರ್ನಾಟಕ ಸರ್ಕಾರದ ಸರ್ವರ್‌ಗಳು ಕ್ಲೌಡ್ ಸರ್ವರ್‌ಗಳಿಂದ ಬರುವ ವಿನಂತಿಗಳನ್ನು ನಿರ್ಬಂಧಿಸಬಹುದು. 
+    ಸಂಪರ್ಕದ ಸಮಸ್ಯೆಗಳು ಉಂಟಾದರೆ, ಈ ಅಪ್ಲಿಕೇಶನ್ ಅನ್ನು ಸ್ಥಳೀಯವಾಗಿ ಚಲಾಯಿಸಿ.
+    """)
+    
+    selected_url_name = st.selectbox(
+        "ಸುತ್ತೋಲೆ ವಿಧವನ್ನು ಆಯ್ಕೆ ಮಾಡಿ:",
+        list(urls.keys())
+    )
+    
+    if st.button("ಡೇಟಾ ಪಡೆಯಿರಿ"):
+        with st.spinner("ಡೇಟಾ ಪಡೆಯಲಾಗುತ್ತಿದೆ... (ಸರ್ಕಾರಿ ಸರ್ವರ್‌ಗೆ ಸಂಪರ್ಕಿಸಲು 60 ಸೆಕೆಂಡುಗಳವರೆಗೆ ತೆಗೆದುಕೊಳ್ಳಬಹುದು)"):
+            df = scrape_table(urls[selected_url_name])
+            
+            if df is not None and not df.empty:
+                # Store the full dataframe in session state
+                st.session_state['full_df'] = df
+                
+                # Create preview dataframe - remove technical columns
+                preview_df = df.drop(['date_obj', 'url'], axis=1)
+                
+                # Show preview with clickable links
+                st.subheader("ಡೇಟಾ ಪ್ರಿವ್ಯೂ")
+                st.dataframe(
+                    preview_df,
+                    height=400,
+                    column_config={
+                        "ಸುತ್ತೋಲೆ": st.column_config.LinkColumn("ಸುತ್ತೋಲೆ")
+                    },
+                    hide_index=True
+                )
+                
+                # Handle PDF preview
+                if 'selected_row' in st.session_state:
+                    selected_url = st.session_state['full_df'].iloc[st.session_state['selected_row']]['url']
+                    if selected_url:
+                        st.subheader("PDF ಪ್ರಿವ್ಯೂ")
+                        display_pdf(selected_url)
+                
+                # Create Excel file
+                excel_data = create_excel_file(df)
+                current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                file_name = f"ಸುತ್ತೋಲೆಗಳು_{current_time}.xlsx"
+                
+                st.download_button(
+                    label="Excel ಫೈಲ್ ಡೌನ್‌ಲೋಡ್ ಮಾಡಿ",
+                    data=excel_data,
+                    file_name=file_name,
+                    mime="application/vnd.ms-excel"
+                )
+                
+                st.info(f"ಒಟ್ಟು {len(df)} ದಾಖಲೆಗಳು ಪಡೆಯಲಾಗಿದೆ")
+    
+    # Add offline usage instructions
+    st.markdown("""
+    ### ಸ್ಥಳೀಯವಾಗಿ ಚಲಾಯಿಸಲು ಸೂಚನೆಗಳು:
+    
+    ಕ್ಲೌಡ್‌ನಲ್ಲಿ ಸಂಪರ್ಕ ಸಮಸ್ಯೆಗಳು ಉಂಟಾದರೆ, ಈ ಅಪ್ಲಿಕೇಶನ್ ಅನ್ನು ಸ್ಥಳೀಯವಾಗಿ ಚಲಾಯಿಸಿ:
+    
+    1. `pip install streamlit pandas requests beautifulsoup4 xlsxwriter urllib3`
+    2. ಕೋಡ್ ಅನ್ನು ಫೈಲ್‌ಗೆ ಉಳಿಸಿ (ಉದಾ: `app.py`)
+    3. `streamlit run app.py` ಚಲಾಯಿಸಿ
+    """)
+    
+    # Footer watermark
+    st.markdown(
+        "<div style='text-align: center; color: #888; padding: 20px; font-style: italic;'>©2025 Teju SMP</div>",
+        unsafe_allow_html=True
+    )
+
+if __name__ == "__main__":
+    main()
